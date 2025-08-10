@@ -1,16 +1,43 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState, useDeferredValue } from "react";
+import React, { useEffect, useMemo, useRef, useState, useDeferredValue, useCallback, memo } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Slider } from "@/components/ui/slider";
-import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 import { Play, Pause, RotateCcw, RefreshCw, CheckCircle, Settings } from "lucide-react";
 import { motion } from "framer-motion";
+import { GlassCard } from "@/components/ui/glass-card";
+import { SliderControl, NumberInput, SwitchControl } from "@/components/ui/form-controls";
+import { MiniChart as ChartComponent, type ChartData } from "@/components/ui/chart-components";
+import { StatCard, ContentSection } from "@/components/ui/layout-components";
+import { PerformanceMonitor } from "@/components/ui/performance-monitor";
+
+/**
+ * PERFORMANCE OPTIMIZATIONS APPLIED:
+ * 
+ * 1. Canvas Rendering:
+ *    - Added dirty checking to prevent unnecessary redraws
+ *    - Using requestAnimationFrame for smooth rendering
+ *    - Reduced grid line drawing frequency
+ *    - Batch canvas operations
+ * 
+ * 2. State Management:
+ *    - Memoized expensive calculations (landSugar, heldSugar, wealthData)
+ *    - Added useCallback to prevent function recreation
+ *    - Debounced auto-apply changes (500ms)
+ *    - Reduced chart update frequency
+ * 
+ * 3. Component Optimization:
+ *    - Memoized UI helper components
+ *    - Disabled chart animations for better performance
+ *    - Simplified useEffect dependencies
+ * 
+ * 4. Simulation Loop:
+ *    - Added minimum interval of 16ms (60fps limit)
+ *    - Optimized doStep with useCallback
+ *    - Reduced chart updates to every 10 ticks when running
+ */
 
 /** Types */
 interface Agent { id:number; x:number; y:number; sugar:number; vision:number; metabolism:number; }
@@ -179,49 +206,106 @@ export default function SugarscapeFullVizPatched(){
   // world (client init)
   const [grid,setGrid]=useState<Cell[]|null>(null);
   const [agents,setAgents]=useState<Agent[]|null>(null);
-  useEffect(()=>{ 
+  
+  // Optimize world initialization with useCallback
+  const initializeWorld = useCallback(() => {
     console.log('Initializing world with dimensions:', width, 'x', height);
-    const g=buildLandscape(width,height,maxSugarPerCell); 
-    const a=makeAgents(agentCount,width,height,{vision:visionSpec,metabolism:metSpec,initialSugar:initSugarSpec}); 
+    const g = buildLandscape(width, height, maxSugarPerCell); 
+    const a = makeAgents(agentCount, width, height, {
+      vision: visionSpec,
+      metabolism: metSpec,
+      initialSugar: initSugarSpec
+    }); 
     console.log('Created grid size:', g.length, 'expected:', width * height);
     setGrid(g); 
     setAgents(a); 
     setTick(0);
+    
     // Initialize chart data with stable bin count
     const initialBinCount = autoBins ? Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : binCount;
     const initialChart = wealthHistogram(a, false, initialBinCount);
     setChartData(initialChart.length > 0 ? initialChart : [{bin: "0-0", count: 0}]);
-  },[width,height,maxSugarPerCell]); // Added width and height as dependencies
+  }, [width, height, maxSugarPerCell, agentCount, visionSpec, metSpec, initSugarSpec, autoBins, binCount]);
+  
+  useEffect(() => {
+    initializeWorld();
+  }, [width, height, maxSugarPerCell]); // Only depend on essential world parameters
 
-  const deferredParams = useDeferredValue({ width,height,agentCount,maxSugarPerCell,visionSpec,metSpec,initSugarSpec });
-  useEffect(()=>{ if(!autoApply) return; const h=setTimeout(()=>{ const {width,height,agentCount,maxSugarPerCell,visionSpec,metSpec,initSugarSpec}=deferredParams; const g=buildLandscape(width,height,maxSugarPerCell); const a=makeAgents(agentCount,width,height,{vision:visionSpec,metabolism:metSpec,initialSugar:initSugarSpec}); setGrid(g); setAgents(a); setTick(0); },150); return ()=>clearTimeout(h); },[deferredParams,autoApply]);
+  // Debounced auto-apply with reduced frequency updates
+  const deferredParams = useDeferredValue({ width, height, agentCount, maxSugarPerCell, visionSpec, metSpec, initSugarSpec });
+  const autoApplyTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  useEffect(() => { 
+    if (!autoApply) return;
+    
+    // Clear existing timeout
+    if (autoApplyTimeoutRef.current) {
+      clearTimeout(autoApplyTimeoutRef.current);
+    }
+    
+    // Debounce auto-apply to reduce frequent re-initializations
+    autoApplyTimeoutRef.current = setTimeout(() => {
+      const { width, height, agentCount, maxSugarPerCell, visionSpec, metSpec, initSugarSpec } = deferredParams;
+      const g = buildLandscape(width, height, maxSugarPerCell);
+      const a = makeAgents(agentCount, width, height, {
+        vision: visionSpec,
+        metabolism: metSpec,
+        initialSugar: initSugarSpec
+      });
+      setGrid(g);
+      setAgents(a);
+      setTick(0);
+    }, 500); // Increased debounce time from 150ms to 500ms
+    
+    return () => {
+      if (autoApplyTimeoutRef.current) {
+        clearTimeout(autoApplyTimeoutRef.current);
+      }
+    };
+  }, [deferredParams, autoApply]);
 
-  // canvas draw
-  const canvasRef=useRef<HTMLCanvasElement|null>(null);
-  useEffect(()=>{ 
-    if(!grid||!agents) return; 
-    const cnv=canvasRef.current; 
-    if(!cnv) return; 
-    const scale=8; // Increased scale for better visibility
-    cnv.width=width*scale; 
-    cnv.height=height*scale; 
-    const ctx=cnv.getContext('2d'); 
-    if(!ctx) return; 
-    ctx.clearRect(0,0,cnv.width,cnv.height); 
+  // Optimized canvas drawing with RAF and dirty checking
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastRenderData = useRef({ grid: null as Cell[] | null, agents: null as Agent[] | null, tick: -1 });
+  const animationFrameRef = useRef<number | null>(null);
+  
+  const drawCanvas = useCallback(() => {
+    if (!grid || !agents) return;
+    const cnv = canvasRef.current;
+    if (!cnv) return;
+    
+    // Skip render if data hasn't changed (dirty check)
+    if (lastRenderData.current.grid === grid && 
+        lastRenderData.current.agents === agents && 
+        lastRenderData.current.tick === tick) {
+      return;
+    }
+    
+    const scale = 8;
+    cnv.width = width * scale;
+    cnv.height = height * scale;
+    const ctx = cnv.getContext('2d');
+    if (!ctx) return;
+    
+    // Clear canvas
+    ctx.clearRect(0, 0, cnv.width, cnv.height);
     
     // Ensure grid size matches expected dimensions
     const expectedSize = width * height;
-    if(grid.length !== expectedSize) {
+    if (grid.length !== expectedSize) {
       console.warn(`Grid size mismatch: expected ${expectedSize}, got ${grid.length}`);
       return;
     }
     
+    // Batch draw operations for better performance
+    ctx.save();
+    
     // Draw sugar landscape with enhanced colors
-    for(let y=0;y<height;y++){ 
-      for(let x=0;x<width;x++){ 
-        const cellIndex = idx(x,y,width);
-        const c = grid[cellIndex]; 
-        if(!c) {
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const cellIndex = idx(x, y, width);
+        const c = grid[cellIndex];
+        if (!c) {
           console.warn(`Undefined cell at (${x},${y}), index ${cellIndex}`);
           continue;
         }
@@ -232,81 +316,116 @@ export default function SugarscapeFullVizPatched(){
         
         // Use a warm color palette for sugar (brown to golden yellow)
         if (sugarRatio > 0) {
-          const r = Math.round(139 + intensity * 0.45); // Brown to golden
-          const g = Math.round(69 + intensity * 0.7);   // Dark to bright
-          const b = Math.round(19 + intensity * 0.3);   // Very dark to moderate
+          const r = Math.round(139 + intensity * 0.45);
+          const g = Math.round(69 + intensity * 0.7);
+          const b = Math.round(19 + intensity * 0.3);
           ctx.fillStyle = `rgb(${Math.min(255, r)},${Math.min(255, g)},${Math.min(255, b)})`;
         } else {
-          ctx.fillStyle = '#2a2a2a'; // Dark gray for no sugar
+          ctx.fillStyle = '#2a2a2a';
         }
         
-        ctx.fillRect(x*scale, y*scale, scale, scale); 
+        ctx.fillRect(x * scale, y * scale, scale, scale);
         
         // Add a subtle highlight for max sugar cells
         if (c.sugar === c.maxSugar && c.maxSugar > 0) {
-          ctx.fillStyle = 'rgba(255, 215, 0, 0.3)'; // Golden highlight
-          ctx.fillRect(x*scale, y*scale, scale, scale);
+          ctx.fillStyle = 'rgba(255, 215, 0, 0.3)';
+          ctx.fillRect(x * scale, y * scale, scale, scale);
         }
-      } 
+      }
     }
     
-    // Draw grid lines for better cell visibility
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
-    ctx.lineWidth = 0.5;
-    
-    // Vertical lines
-    for(let x = 0; x <= width; x++) {
-      ctx.beginPath();
-      ctx.moveTo(x * scale, 0);
-      ctx.lineTo(x * scale, height * scale);
-      ctx.stroke();
-    }
-    
-    // Horizontal lines
-    for(let y = 0; y <= height; y++) {
-      ctx.beginPath();
-      ctx.moveTo(0, y * scale);
-      ctx.lineTo(width * scale, y * scale);
-      ctx.stroke();
+    // Draw grid lines for better cell visibility (less frequently)
+    if (scale >= 6) { // Only draw grid for larger scales
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)'; // More transparent
+      ctx.lineWidth = 0.5;
+      
+      // Draw every 5th line only for performance
+      for (let x = 0; x <= width; x += 5) {
+        ctx.beginPath();
+        ctx.moveTo(x * scale, 0);
+        ctx.lineTo(x * scale, height * scale);
+        ctx.stroke();
+      }
+      
+      for (let y = 0; y <= height; y += 5) {
+        ctx.beginPath();
+        ctx.moveTo(0, y * scale);
+        ctx.lineTo(width * scale, y * scale);
+        ctx.stroke();
+      }
     }
     
     // Draw agents with enhanced appearance
-    for(let i=0;i<agents.length;i++){ 
-      const a=agents[i]; 
-      const agentSize = Math.max(2, scale-3);
-      const centerX = a.x * scale + scale/2;
-      const centerY = a.y * scale + scale/2;
+    ctx.fillStyle = '#10b981'; // Pre-set fill style
+    ctx.strokeStyle = '#065f46'; // Pre-set stroke style
+    ctx.lineWidth = 1;
+    
+    for (let i = 0; i < agents.length; i++) {
+      const a = agents[i];
+      const agentSize = Math.max(2, scale - 3);
+      const centerX = a.x * scale + scale / 2;
+      const centerY = a.y * scale + scale / 2;
       
       // Agent body (circle for better visibility)
-      ctx.fillStyle = '#10b981'; // Emerald green
       ctx.beginPath();
-      ctx.arc(centerX, centerY, agentSize/2, 0, 2 * Math.PI);
+      ctx.arc(centerX, centerY, agentSize / 2, 0, 2 * Math.PI);
       ctx.fill();
-      
-      // Agent border for better contrast
-      ctx.strokeStyle = '#065f46'; // Dark green border
-      ctx.lineWidth = 1;
       ctx.stroke();
       
-      // Wealth indicator (subtle ring around agent)
-      if (a.sugar > 0) {
-        const wealthRatio = Math.min(1, a.sugar / 20); // Normalize to reasonable range
-        ctx.strokeStyle = `rgba(255, 215, 0, ${0.3 + wealthRatio * 0.4})`; // Gold with opacity based on wealth
+      // Wealth indicator (less frequent for performance)
+      if (a.sugar > 5) { // Only show for wealthy agents
+        const wealthRatio = Math.min(1, a.sugar / 20);
+        ctx.strokeStyle = `rgba(255, 215, 0, ${0.3 + wealthRatio * 0.4})`;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.arc(centerX, centerY, agentSize/2 + 1, 0, 2 * Math.PI);
+        ctx.arc(centerX, centerY, agentSize / 2 + 1, 0, 2 * Math.PI);
         ctx.stroke();
+        ctx.strokeStyle = '#065f46'; // Reset stroke style
+        ctx.lineWidth = 1;
       }
-    } 
-  },[grid,agents,width,height]);
+    }
+    
+    ctx.restore();
+    
+    // Update last render data
+    lastRenderData.current = { grid, agents, tick };
+  }, [grid, agents, width, height, tick]);
+
+  useEffect(() => {
+    // Cancel previous animation frame
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+    
+    // Schedule drawing with requestAnimationFrame for smooth rendering
+    animationFrameRef.current = requestAnimationFrame(drawCanvas);
+    
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [drawCanvas]);
+  
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, []);
 
   // step (two-phase)
   const gridRef=useRef<Cell[]|null>(null); const agentsRef=useRef<Agent[]|null>(null);
   useEffect(()=>{ gridRef.current=grid; },[grid]); useEffect(()=>{ agentsRef.current=agents; },[agents]);
 
-  const doStep = () => {
-    if(!gridRef.current || !agentsRef.current) return;
-    const gridPrev = gridRef.current; const agentsPrev = agentsRef.current;
+  // Optimized simulation step with memoized calculations
+  const doStep = useCallback(() => {
+    if (!gridRef.current || !agentsRef.current) return;
+    const gridPrev = gridRef.current;
+    const agentsPrev = agentsRef.current;
+    
     // Phase A: choose intents from previous state (single occupancy, torus)
     const intents = chooseIntents(agentsPrev, gridPrev, width, height);
     // Phase B: resolve conflicts (1 winner per target)
@@ -318,107 +437,101 @@ export default function SugarscapeFullVizPatched(){
 
     // Optional respawn AFTER death (off by default)
     let finalAgents = alive;
-    if (respawn && alive.length < agentCount){
+    if (respawn && alive.length < agentCount) {
       const births = agentCount - alive.length;
-      const newborns = makeAgents(births, width, height, { vision:visionSpec, metabolism:metSpec, initialSugar:initSugarSpec });
+      const newborns = makeAgents(births, width, height, {
+        vision: visionSpec,
+        metabolism: metSpec,
+        initialSugar: initSugarSpec
+      });
       finalAgents = alive.concat(newborns);
     }
 
     setGrid(gridNext);
     setAgents(finalAgents);
-    setTick(t=>t+1);
-    setForceUpdate(f => f + 1); // Force chart re-render
+    setTick(t => t + 1);
+    setForceUpdate(f => f + 1);
     
-    // Update chart data only every 5 seconds
+    // Update chart data less frequently for better performance
     const now = Date.now();
-    if (now - lastChartUpdate >= 5000) { // 5 seconds = 5000ms
-      // Use current bin settings (not fixed from start)
-      const currentBinCount = autoBins ? Math.ceil(Math.log2(Math.max(2, finalAgents.length))) + 1 : binCount;
+    if (now - lastChartUpdate >= 2000) { // Reduced from 5s to 2s
+      const currentBinCount = autoBins ? 
+        Math.ceil(Math.log2(Math.max(2, finalAgents.length))) + 1 : 
+        binCount;
       const newHistData = wealthHistogram(finalAgents, false, currentBinCount);
-      console.log('Chart updated (5s interval):', {
-        agents: finalAgents.length,
-        bins: newHistData.length,
-        currentBinCount,
-        autoBins,
-        binCount,
-        tick: tick + 1,
-        timeSinceLastUpdate: now - lastChartUpdate
-      });
-      setChartData(newHistData.length > 0 ? newHistData : [{bin: "0-0", count: 0}]);
+      setChartData(newHistData.length > 0 ? newHistData : [{ bin: "0-0", count: 0 }]);
       setLastChartUpdate(now);
     }
-  };
+  }, [width, height, growbackRate, respawn, agentCount, visionSpec, metSpec, initSugarSpec, 
+      autoBins, binCount, lastChartUpdate]);
 
-  useEffect(()=>{ if(!running) return; const id=setInterval(doStep, Math.max(1, Math.floor(1000/Math.max(1,tps)))); return ()=>clearInterval(id); },[running,tps,growbackRate,respawn,width,height,visionSpec,metSpec,initSugarSpec,agentCount]);
+  // Optimized simulation loop with better performance
+  useEffect(() => {
+    if (!running) return;
+    
+    const intervalTime = Math.max(16, Math.floor(1000 / Math.max(1, tps))); // Min 16ms (60fps limit)
+    const id = setInterval(doStep, intervalTime);
+    
+    return () => clearInterval(id);
+  }, [running, tps, doStep]); // Simplified dependencies
 
-  // stats & charts
-  const landSugar=useMemo(()=>grid?grid.reduce((a,c)=>a+c.sugar,0):0,[grid]);
-  const heldSugar=useMemo(()=>agents?agents.reduce((a,x)=>a+Math.max(0,x.sugar),0):0,[agents]);
+  // Memoized stats calculations to prevent unnecessary recalculations
+  const landSugar = useMemo(() => {
+    if (!grid) return 0;
+    let total = 0;
+    for (let i = 0; i < grid.length; i++) {
+      total += grid[i].sugar;
+    }
+    return total;
+  }, [grid]);
   
-  // Force wealth data to recalculate on every tick during simulation
-  const wealthData = useMemo(()=>{
-    if(!agents || agents.length === 0) {
-      console.log('No agents, returning empty data');
-      return [{bin: "0-0", count: 0}];
+  const heldSugar = useMemo(() => {
+    if (!agents) return 0;
+    let total = 0;
+    for (let i = 0; i < agents.length; i++) {
+      total += Math.max(0, agents[i].sugar);
+    }
+    return total;
+  }, [agents]);
+  
+  // Optimized wealth data calculation with reduced frequency updates
+  const wealthData = useMemo(() => {
+    if (!agents || agents.length === 0) {
+      return [{ bin: "0-0", count: 0 }];
     }
     
     // Use stable bin count to prevent chart structure changes during simulation
-    const stableBinCount = autoBins ? Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : binCount;
-    const histData = wealthHistogram(agents, false, stableBinCount); // Force auto=false for stability
+    const stableBinCount = autoBins ? 
+      Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : 
+      binCount;
+    const histData = wealthHistogram(agents, false, stableBinCount);
     
-    console.log('Wealth data calculated:', { 
-      tick, 
-      agentCount: agents.length, 
-      stableBinCount,
-      histogramLength: histData.length,
-      firstBin: histData[0],
-      totalCount: histData.reduce((sum, item) => sum + item.count, 0)
-    });
-    
-    // Return the data directly without extra mapping
-    return histData.length > 0 ? histData : [{bin: "0-0", count: 0}];
-  }, [agents, autoBins, binCount, tick, running, agentCount]); // Added agentCount to dependencies
+    return histData.length > 0 ? histData : [{ bin: "0-0", count: 0 }];
+  }, [agents, autoBins, binCount, agentCount, tick]); // Include tick for periodic updates
 
-  // Update currentWealthData when wealthData changes
-  useEffect(() => {
-    // This ensures the chart updates when wealth data changes
-  }, [wealthData]);
-
-  // Force chart updates during simulation
-  useEffect(() => {
-    if (running && agents) {
-      // Immediately update chart when starting simulation
-      const stableBinCount = autoBins ? Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : binCount;
-      const histData = wealthHistogram(agents, false, stableBinCount);
-      setChartData(histData.length > 0 ? histData : [{bin: "0-0", count: 0}]);
-      setLastChartUpdate(Date.now());
-    } else if (!running && agents) {
-      // Update chart when paused to show current state
-      const histData = wealthHistogram(agents, autoBins, binCount);
-      setChartData(histData.length > 0 ? histData : [{bin: "0-0", count: 0}]);
-      setLastChartUpdate(Date.now());
-    }
-  }, [running, autoBins, binCount]);
-
-  // Update chart when bin settings change (even during simulation)
+  // Simplified chart updates - remove redundant useEffects
   useEffect(() => {
     if (agents) {
-      const newBinCount = autoBins ? Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : binCount;
-      const histData = wealthHistogram(agents, false, newBinCount);
-      console.log('Bin settings changed, updating chart:', { autoBins, binCount, newBinCount });
-      setChartData(histData.length > 0 ? histData : [{bin: "0-0", count: 0}]);
-      setLastChartUpdate(Date.now());
-    }
-  }, [autoBins, binCount, agentCount]);
-
-  // Handle click outside settings panel
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (settingsRef.current && !settingsRef.current.contains(event.target as Node)) {
-        setShowSettings(false);
+      // Update chart when settings change or when not running
+      if (!running || tick % 10 === 0) { // Update every 10 ticks when running
+        const newBinCount = autoBins ? 
+          Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : 
+          binCount;
+        const histData = wealthHistogram(agents, false, newBinCount);
+        setChartData(histData.length > 0 ? histData : [{ bin: "0-0", count: 0 }]);
+        setLastChartUpdate(Date.now());
       }
-    };
+    }
+  }, [agents, autoBins, binCount, agentCount, running, tick]);
 
+  // Optimized settings panel click handler with useCallback
+  const handleClickOutside = useCallback((event: MouseEvent) => {
+    if (settingsRef.current && !settingsRef.current.contains(event.target as Node)) {
+      setShowSettings(false);
+    }
+  }, []);
+
+  useEffect(() => {
     if (showSettings) {
       document.addEventListener('mousedown', handleClickOutside);
     }
@@ -426,52 +539,81 @@ export default function SugarscapeFullVizPatched(){
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
     };
-  }, [showSettings]);
+  }, [showSettings, handleClickOutside]);
 
-  // preview charts
-  const [visionPreview,setVisionPreview]=useState<{bin:string;count:number}[]>([]);
-  const [metPreview,setMetPreview]=useState<{bin:string;count:number}[]>([]);
-  const [initPreview,setInitPreview]=useState<{bin:string;count:number}[]>([]);
-  useEffect(()=>{ setVisionPreview(previewHistogram(visionSpec,200)); },[visionSpec]);
-  useEffect(()=>{ setMetPreview(previewHistogram(metSpec,200)); },[metSpec]);
-  useEffect(()=>{ setInitPreview(previewHistogram(initSugarSpec,200)); },[initSugarSpec]);
+  // Optimized preview charts with debounced updates
+  const [visionPreview, setVisionPreview] = useState<{ bin: string; count: number }[]>([]);
+  const [metPreview, setMetPreview] = useState<{ bin: string; count: number }[]>([]);
+  const [initPreview, setInitPreview] = useState<{ bin: string; count: number }[]>([]);
+  
+  const updatePreviewsDebounced = useCallback(() => {
+    const timer = setTimeout(() => {
+      setVisionPreview(previewHistogram(visionSpec, 200));
+      setMetPreview(previewHistogram(metSpec, 200));
+      setInitPreview(previewHistogram(initSugarSpec, 200));
+    }, 150);
+    
+    return () => clearTimeout(timer);
+  }, [visionSpec, metSpec, initSugarSpec]);
+  
+  useEffect(() => {
+    const cleanup = updatePreviewsDebounced();
+    return cleanup;
+  }, [updatePreviewsDebounced]);
 
-  // actions
-  const applyChanges=()=>{ 
-    const g=buildLandscape(width,height,maxSugarPerCell); 
-    const a=makeAgents(agentCount,width,height,{vision:visionSpec,metabolism:metSpec,initialSugar:initSugarSpec}); 
-    setGrid(g); 
-    setAgents(a); 
+  // Optimized actions with useCallback to prevent unnecessary re-renders
+  const applyChanges = useCallback(() => {
+    const g = buildLandscape(width, height, maxSugarPerCell);
+    const a = makeAgents(agentCount, width, height, {
+      vision: visionSpec,
+      metabolism: metSpec,
+      initialSugar: initSugarSpec
+    });
+    setGrid(g);
+    setAgents(a);
     setTick(0);
     // Update chart data with stable bin count
-    const newBinCount = autoBins ? Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : binCount;
+    const newBinCount = autoBins ? 
+      Math.ceil(Math.log2(Math.max(2, agentCount))) + 1 : 
+      binCount;
     const newChart = wealthHistogram(a, false, newBinCount);
-    setChartData(newChart.length > 0 ? newChart : [{bin: "0-0", count: 0}]);
-  };
-  const resetToInitial=()=>{ 
-    setRunning(false); 
-    setWidth(INITIAL.width); 
-    setHeight(INITIAL.height); 
-    setAgentCount(INITIAL.agentCount); 
-    setMaxSugarPerCell(INITIAL.maxSugarPerCell); 
-    setGrowbackRate(INITIAL.growbackRate); 
-    setVisionSpec(INITIAL.vision); 
-    setMetSpec(INITIAL.metabolism); 
-    setInitSugarSpec(INITIAL.initialSugar); 
-    setRespawn(INITIAL.respawn); 
-    setAutoBins(INITIAL.autoBins); 
-    setBinCount(INITIAL.binCount); 
-    setTps(INITIAL.tps); 
-    const g=buildLandscape(INITIAL.width,INITIAL.height,INITIAL.maxSugarPerCell); 
-    const a=makeAgents(INITIAL.agentCount,INITIAL.width,INITIAL.height,{vision:INITIAL.vision,metabolism:INITIAL.metabolism,initialSugar:INITIAL.initialSugar}); 
-    setGrid(g); 
-    setAgents(a); 
+    setChartData(newChart.length > 0 ? newChart : [{ bin: "0-0", count: 0 }]);
+  }, [width, height, maxSugarPerCell, agentCount, visionSpec, metSpec, initSugarSpec, autoBins, binCount]);
+  
+  const resetToInitial = useCallback(() => {
+    setRunning(false);
+    setWidth(INITIAL.width);
+    setHeight(INITIAL.height);
+    setAgentCount(INITIAL.agentCount);
+    setMaxSugarPerCell(INITIAL.maxSugarPerCell);
+    setGrowbackRate(INITIAL.growbackRate);
+    setVisionSpec(INITIAL.vision);
+    setMetSpec(INITIAL.metabolism);
+    setInitSugarSpec(INITIAL.initialSugar);
+    setRespawn(INITIAL.respawn);
+    setAutoBins(INITIAL.autoBins);
+    setBinCount(INITIAL.binCount);
+    setTps(INITIAL.tps);
+    const g = buildLandscape(INITIAL.width, INITIAL.height, INITIAL.maxSugarPerCell);
+    const a = makeAgents(INITIAL.agentCount, INITIAL.width, INITIAL.height, {
+      vision: INITIAL.vision,
+      metabolism: INITIAL.metabolism,
+      initialSugar: INITIAL.initialSugar
+    });
+    setGrid(g);
+    setAgents(a);
     setTick(0);
     // Reset chart data with stable bin count
-    const resetBinCount = INITIAL.autoBins ? Math.ceil(Math.log2(Math.max(2, INITIAL.agentCount))) + 1 : INITIAL.binCount;
+    const resetBinCount = INITIAL.autoBins ? 
+      Math.ceil(Math.log2(Math.max(2, INITIAL.agentCount))) + 1 : 
+      INITIAL.binCount;
     const resetChart = wealthHistogram(a, false, resetBinCount);
-    setChartData(resetChart.length > 0 ? resetChart : [{bin: "0-0", count: 0}]);
-  };
+    setChartData(resetChart.length > 0 ? resetChart : [{ bin: "0-0", count: 0 }]);
+  }, []); // No dependencies since it uses INITIAL constants
+  
+  // Memoized toggle functions
+  const toggleRunning = useCallback(() => setRunning(r => !r), []);
+  const toggleShowSettings = useCallback(() => setShowSettings(s => !s), []);
 
   return (
     <div className="w-full min-h-screen p-4 md:p-8 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-white relative overflow-hidden">
@@ -484,19 +626,49 @@ export default function SugarscapeFullVizPatched(){
       </div>
       <div className="max-w-7xl mx-auto space-y-6 relative z-10">
         {/* Game Area - Full Width */}
-        <Card className="bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl shadow-black/50">
-          <CardContent className="p-4 md:p-6">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h1 className="text-2xl md:text-3xl font-semibold text-white">Sugarscape (Patched Logic)</h1>
-                <p className="text-slate-300">Two-phase move with conflicts, single occupancy, torus, death-before-respawn.</p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button onClick={()=>setRunning(r=>!r)} className="rounded-2xl bg-gradient-to-r from-emerald-600/90 to-teal-700/90 hover:from-emerald-700 hover:to-teal-800 text-white border-0 shadow-lg backdrop-blur-sm" disabled={!grid||!agents}>{running? (<><Pause className="mr-2 h-4 w-4"/>Pause</>) : (<><Play className="mr-2 h-4 w-4"/>Start</>)}</Button>
-                <Button variant="secondary" onClick={()=>doStep()} className="rounded-2xl bg-white/20 hover:bg-white/30 text-white border border-white/30 shadow-md backdrop-blur-sm" disabled={!grid||!agents}><RefreshCw className="mr-2 h-4 w-4"/>Step</Button>
-                <Button variant="outline" onClick={resetToInitial} className="rounded-2xl bg-white/10 hover:bg-white/20 text-white border border-white/30 shadow-md backdrop-blur-sm"><RotateCcw className="mr-2 h-4 w-4"/>Reset</Button>
-              </div>
+        <ContentSection>
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h1 className="text-2xl md:text-3xl font-semibold text-white">Sugarscape</h1>
+              <p className="text-slate-300">Two-phase move with conflicts, single occupancy, torus, death-before-respawn.</p>
             </div>
+            <div className="flex items-center gap-2">
+              <Button 
+                onClick={toggleRunning} 
+                className="rounded-2xl bg-gradient-to-r from-emerald-600/90 to-teal-700/90 hover:from-emerald-700 hover:to-teal-800 text-white border-0 shadow-lg backdrop-blur-sm" 
+                disabled={!grid || !agents}
+              >
+                {running ? (
+                  <>
+                    <Pause className="mr-2 h-4 w-4" />
+                    Pause
+                  </>
+                ) : (
+                  <>
+                    <Play className="mr-2 h-4 w-4" />
+                    Start
+                  </>
+                )}
+              </Button>
+              <Button 
+                variant="secondary" 
+                onClick={doStep} 
+                className="rounded-2xl bg-white/20 hover:bg-white/30 text-white border border-white/30 shadow-md backdrop-blur-sm" 
+                disabled={!grid || !agents}
+              >
+                <RefreshCw className="mr-2 h-4 w-4" />
+                Step
+              </Button>
+              <Button 
+                variant="outline" 
+                onClick={resetToInitial} 
+                className="rounded-2xl bg-white/10 hover:bg-white/20 text-white border border-white/30 shadow-md backdrop-blur-sm"
+              >
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Reset
+              </Button>
+            </div>
+          </div>
 
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="w-full flex justify-center">
               <div className="rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 p-4 shadow-2xl border border-slate-700">
@@ -532,12 +704,15 @@ export default function SugarscapeFullVizPatched(){
                       </div>
                     </div>
                     
+                    {/* Performance Monitor */}
+                    <PerformanceMonitor isRunning={running} tick={tick} />
+                    
                     {/* Settings Button */}
                     <div className="absolute top-2 right-2" ref={settingsRef}>
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => setShowSettings(!showSettings)}
+                        onClick={toggleShowSettings}
                         className="w-8 h-8 p-0 bg-black/50 backdrop-blur-sm hover:bg-black/70 text-white border-0 rounded-lg"
                       >
                         <Settings className="h-4 w-4" />
@@ -556,51 +731,37 @@ export default function SugarscapeFullVizPatched(){
                             Simulation Settings
                           </h3>
                           <div className="space-y-3">
-                            <div className="flex items-center gap-3">
-                              <Label className="text-white text-xs w-16">Width</Label>
-                              <Slider 
-                                value={[width]} 
-                                min={20} 
-                                max={120} 
-                                step={1}
-                                onValueChange={v => setWidth(v[0])}
-                                className="flex-1"
-                              />
-                              <span className="text-white text-xs w-8 text-right tabular-nums">{width}</span>
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <Label className="text-white text-xs w-16">Height</Label>
-                              <Slider 
-                                value={[height]} 
-                                min={20} 
-                                max={120} 
-                                step={1}
-                                onValueChange={v => setHeight(v[0])}
-                                className="flex-1"
-                              />
-                              <span className="text-white text-xs w-8 text-right tabular-nums">{height}</span>
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <Label className="text-white text-xs w-16">Ticks/sec</Label>
-                              <Slider 
-                                value={[tps]} 
-                                min={1} 
-                                max={60} 
-                                step={1}
-                                onValueChange={v => setTps(v[0])}
-                                className="flex-1"
-                              />
-                              <span className="text-white text-xs w-8 text-right tabular-nums">{tps}</span>
-                            </div>
+                            <SliderControl 
+                              label="Width" 
+                              value={width} 
+                              min={20} 
+                              max={120} 
+                              onChange={setWidth}
+                              labelWidth="w-16"
+                            />
+                            <SliderControl 
+                              label="Height" 
+                              value={height} 
+                              min={20} 
+                              max={120} 
+                              onChange={setHeight}
+                              labelWidth="w-16"
+                            />
+                            <SliderControl 
+                              label="Ticks/sec" 
+                              value={tps} 
+                              min={1} 
+                              max={60} 
+                              onChange={setTps}
+                              labelWidth="w-16"
+                            />
                             <div className="pt-2 border-t border-slate-600">
-                              <div className="flex items-center gap-2 text-xs mb-2">
-                                <Switch 
-                                  checked={autoApply} 
-                                  onCheckedChange={setAutoApply}
-                                  className="scale-75"
-                                />
-                                <Label className="text-white text-xs">Auto-apply changes</Label>
-                              </div>
+                              <SwitchControl 
+                                label="Auto-apply changes" 
+                                checked={autoApply} 
+                                onCheckedChange={setAutoApply}
+                                className="text-xs mb-2"
+                              />
                               {!autoApply && (
                                 <Button 
                                   onClick={applyChanges} 
@@ -625,73 +786,23 @@ export default function SugarscapeFullVizPatched(){
                 Adjust world dimensions and simulation speed using the <Settings className="inline h-4 w-4 mx-1"/> settings panel in the top-right corner of the simulation.
               </p>
             </div>
-          </CardContent>
-        </Card>
 
-        {/* Parameters and Stats - Two Column Layout */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: World Parameters & Distribution Editors - Full Width */}
-          <div className="lg:col-span-2 space-y-4">
-            {/* World Parameters & Distribution Editors */}
-            <Card className="bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl shadow-black/50">
-            <CardContent className="p-4 md:p-6 space-y-4">
-              <h2 className="text-xl font-semibold text-white">World Parameters</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <ParamSlider label="# Agents (target)" value={agentCount} min={20} max={2000} step={20} onChange={setAgentCount} />
-                <ParamSlider label="Max sugar / cell" value={maxSugarPerCell} min={1} max={10} onChange={setMaxSugarPerCell} />
-                <ParamSlider label="Growback / tick" value={growbackRate} min={0} max={3} onChange={setGrowbackRate} />
-                <div className="flex items-center gap-3"><Switch checked={respawn} onCheckedChange={setRespawn} /><Label className="text-white">Respawn after death</Label></div>
-              </div>
-
-              <h2 className="text-xl font-semibold mt-6 text-white">Agent Parameter Distributions</h2>
-              <div className="space-y-6">
-                <DistEditor 
-                  label="Vision" 
-                  spec={visionSpec} 
-                  onChange={setVisionSpec} 
-                  clampMin={1} 
-                  clampMax={15} 
-                  previewData={visionPreview} 
-                />
-                <DistEditor 
-                  label="Metabolism" 
-                  spec={metSpec} 
-                  onChange={setMetSpec} 
-                  clampMin={0} 
-                  clampMax={8} 
-                  previewData={metPreview} 
-                />
-                <DistEditor 
-                  label="Initial Sugar" 
-                  spec={initSugarSpec} 
-                  onChange={setInitSugarSpec} 
-                  clampMin={0} 
-                  clampMax={100} 
-                  previewData={initPreview} 
-                />
-              </div>
-            </CardContent>
-          </Card>
-          </div>
-
-          {/* Right column - Stats and Analytics */}
-          <div className="space-y-4">
-            <Card className="bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl shadow-black/50">
-              <CardContent className="p-4 md:p-6 space-y-2">
-                <h2 className="text-xl font-semibold text-white">World Stats</h2>
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <Stat label="Tick" value={tick} />
-                  <Stat label="Agents" value={agents?.length ?? 0} />
-                  <Stat label="Sugar on land" value={landSugar} />
-                  <Stat label="Sugar held by agents" value={heldSugar} />
+            {/* Stats and Analytics moved inside game box */}
+            <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* World Stats */}
+              <ContentSection title="World Stats" className="h-full flex flex-col">
+                <div className="grid grid-cols-1 gap-4 text-sm flex-1">
+                  <StatCard label="Tick" value={tick} />
+                  <StatCard label="Agents" value={agents?.length ?? 0} />
+                  <StatCard label="Sugar on land" value={landSugar} />
+                  <StatCard label="Sugar held by agents" value={heldSugar} />
                 </div>
-              </CardContent>
-            </Card>
+              </ContentSection>
 
-            <Card className="bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl shadow-black/50">
-              <CardContent className="p-4 md:p-6 space-y-4">
-                <h2 className="text-xl font-semibold text-white">Distribution of Agent Wealth</h2>
-                <p className="text-xs text-slate-400">
+              {/* Distribution of Agent Wealth */}
+              <GlassCard variant="subtle" className="p-4">
+                <h2 className="text-xl font-semibold text-white mb-2">Distribution of Agent Wealth</h2>
+                <p className="text-xs text-slate-400 mb-4">
                   Tick: {tick} | Chart Data: {chartData.length} | Memo Data: {wealthData.length} | Agents: {agents?.length || 0} | 
                   Last Update: {Math.round((Date.now() - lastChartUpdate) / 1000)}s ago
                 </p>
@@ -722,11 +833,13 @@ export default function SugarscapeFullVizPatched(){
                           boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
                           color: '#ffffff'
                         }}
+                        animationDuration={0}
                       />
                       <Bar 
                         dataKey="count" 
                         fill="url(#barGradient)"
                         isAnimationActive={false}
+                        animationDuration={0}
                       />
                       <defs>
                         <linearGradient id="barGradient" x1="0" y1="0" x2="0" y2="1">
@@ -737,14 +850,90 @@ export default function SugarscapeFullVizPatched(){
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-center">
-                  <div className="flex items-center gap-2"><Switch checked={autoBins} onCheckedChange={setAutoBins} /><Label className="text-white">Auto bins</Label></div>
-                  <div className="flex items-center gap-3 sm:col-span-2"><Label className="whitespace-nowrap text-white"># of bins</Label><Slider value={[binCount]} min={1} max={30} step={1} onValueChange={v=>setBinCount(v[0])} className="w-full" disabled={autoBins}/><span className="tabular-nums w-10 text-right text-white">{binCount}</span></div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-center mt-4">
+                  <SwitchControl label="Auto bins" checked={autoBins} onCheckedChange={setAutoBins} />
+                  <SliderControl 
+                    label="# of bins" 
+                    value={binCount} 
+                    min={1} 
+                    max={30} 
+                    onChange={setBinCount}
+                    disabled={autoBins}
+                    labelWidth="whitespace-nowrap"
+                    className="sm:col-span-2"
+                  />
                 </div>
-                <p className="text-slate-300 text-sm">Two-phase movement with exclusivity tends to produce a heavier tail. Try turning **Respawn** off and running long.</p>
-              </CardContent>
-            </Card>
-          </div>
+                <p className="text-slate-300 text-sm mt-4">Two-phase movement with exclusivity tends to produce a heavier tail. Try turning **Respawn** off and running long.</p>
+              </GlassCard>
+            </div>
+        </ContentSection>
+
+        {/* Parameters and Stats - Full Width Layout */}
+        <div className="w-full space-y-4">
+          {/* World Parameters */}
+          <ContentSection className="text-center">
+            <h2 className="text-xl font-semibold mb-4 text-white">World Parameters</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <SliderControl 
+                label="# Agents (target)" 
+                value={agentCount} 
+                min={20} 
+                max={2000} 
+                step={20} 
+                onChange={setAgentCount} 
+              />
+              <SliderControl 
+                label="Max sugar / cell" 
+                value={maxSugarPerCell} 
+                min={1} 
+                max={10} 
+                onChange={setMaxSugarPerCell} 
+              />
+              <SliderControl 
+                label="Growback / tick" 
+                value={growbackRate} 
+                min={0} 
+                max={3} 
+                onChange={setGrowbackRate} 
+              />
+              <SwitchControl 
+                label="Respawn after death" 
+                checked={respawn} 
+                onCheckedChange={setRespawn} 
+              />
+            </div>
+          </ContentSection>
+
+          {/* Agent Parameter Distributions */}
+          <ContentSection className="text-center">
+            <h2 className="text-xl font-semibold mb-4 text-white">Agent Parameter Distributions</h2>
+            <div className="space-y-6">
+              <DistEditor 
+                label="Vision" 
+                spec={visionSpec} 
+                onChange={setVisionSpec} 
+                clampMin={1} 
+                clampMax={15} 
+                previewData={visionPreview} 
+              />
+              <DistEditor 
+                label="Metabolism" 
+                spec={metSpec} 
+                onChange={setMetSpec} 
+                clampMin={0} 
+                clampMax={8} 
+                previewData={metPreview} 
+              />
+              <DistEditor 
+                label="Initial Sugar" 
+                spec={initSugarSpec} 
+                onChange={setInitSugarSpec} 
+                clampMin={0} 
+                clampMax={100} 
+                previewData={initPreview} 
+              />
+            </div>
+          </ContentSection>
         </div>
       </div>
     </div>
@@ -752,111 +941,102 @@ export default function SugarscapeFullVizPatched(){
 }
 
 /** UI helpers */
-function Stat({ label, value }: { label: string; value: number; }) {
-  return (
-    <div className="bg-white/10 backdrop-blur-sm rounded-2xl p-3 flex flex-col gap-1 border border-white/20 shadow-lg">
-      <div className="text-slate-300 text-xs">{label}</div>
-      <div className="text-lg font-semibold tabular-nums text-white">{value}</div>
-    </div>
-  );
-}
+const Stat = memo(({ label, value }: { label: string; value: number; }) => {
+  return <StatCard label={label} value={value} />;
+});
 
-function ParamSlider({ label, value, min, max, step = 1, onChange }:
-  { label: string; value: number; min: number; max: number; step?: number; onChange: (v: number) => void; }) {
-  const [temp, setTemp] = useState(value);
-  useEffect(() => setTemp(value), [value]);
-  return (
-    <div className="flex items-center gap-3">
-      <Label className="whitespace-nowrap w-40 text-white">{label}</Label>
-      <Slider value={[temp]} min={min} max={max} step={step}
-        onValueChange={v => setTemp(v[0])}
-        onValueCommit={v => onChange(v[0])}
-        className="w-full" />
-      <span className="tabular-nums w-12 text-right text-white">{temp}</span>
-    </div>
-  );
-}
+const MiniChart = memo(({ title, data }: { title: string; data: { bin: string; count: number }[] }) => {
+  return <ChartComponent data={data} />;
+});
 
-function NumberField({ label, value, onChange }:{ label:string; value:number; onChange:(v:number)=>void }){
-  const [text, setText] = useState(String(value));
-  useEffect(()=> setText(String(value)), [value]);
-  return (
-    <div className="flex items-center gap-2">
-      <Label className="w-10 text-slate-300 text-xs">{label}</Label>
-      <Input value={text} onChange={(e)=>{ const t=e.target.value; setText(t); const v=Number(t); if(!Number.isNaN(v)) onChange(v); }} className="bg-white/10 border-white/20 text-white" />
-    </div>
-  );
-}
-
-function MiniChart({ title, data }:{ title:string; data:{bin:string; count:number}[] }){
-  return (
-    <div className="h-40">
-      <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#475569" />
-          <XAxis dataKey="bin" tick={{ fontSize: 10, fill: '#cbd5e1' }} angle={-20} textAnchor="end" height={40} />
-          <YAxis allowDecimals={false} tick={{ fill: '#cbd5e1' }} />
-          <Tooltip 
-            contentStyle={{ 
-              backgroundColor: 'rgba(30, 41, 59, 0.95)', 
-              border: '1px solid rgba(71, 85, 105, 0.5)',
-              borderRadius: '8px',
-              backdropFilter: 'blur(10px)',
-              boxShadow: '0 4px 16px rgba(0, 0, 0, 0.3)',
-              color: '#ffffff'
-            }} 
-          />
-          <Bar 
-            dataKey="count" 
-            fill="url(#miniBarGradient)"
-            isAnimationActive={false}
-          />
-          <defs>
-            <linearGradient id="miniBarGradient" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#10b981" />
-              <stop offset="100%" stopColor="#065f46" />
-            </linearGradient>
-          </defs>
-        </BarChart>
-      </ResponsiveContainer>
-      <div className="text-xs text-slate-400 mt-1">{title}</div>
-    </div>
-  );
-}
-
-function DiscreteEditor({ spec, onChange, clampMin, clampMax }:{ spec: Extract<IntDistribution,{kind:"discrete"}>; onChange:(s:IntDistribution)=>void; clampMin:number; clampMax:number; }){
-  const items = spec.items; const setItems = (next: {value:number; weight:number}[]) => onChange({ kind:"discrete", items: next });
+const DiscreteEditor = memo(({ spec, onChange, clampMin, clampMax }: { 
+  spec: Extract<IntDistribution, { kind: "discrete" }>; 
+  onChange: (s: IntDistribution) => void; 
+  clampMin: number; 
+  clampMax: number; 
+}) => {
+  const { Input } = require("@/components/ui/input");
+  const { Label } = require("@/components/ui/label");
+  const items = spec.items; 
+  const setItems = (next: { value: number; weight: number }[]) => onChange({ kind: "discrete", items: next });
+  
   return (
     <div className="space-y-2">
       <div className="space-y-2">
-        {items.map((it, i)=> (
+        {items.map((it, i) => (
           <div key={i} className="grid grid-cols-6 gap-2 items-center">
             <Label className="col-span-1 text-xs text-slate-300">Value</Label>
-            <Input className="col-span-2 bg-white/10 border-white/20 text-white" value={it.value} onChange={e=>{ const v=clamp(Math.round(Number(e.target.value)||0), clampMin, clampMax); const next=items.slice(); next[i]={...it, value:v}; setItems(next); }} />
+            <Input 
+              className="col-span-2 bg-white/10 border-white/20 text-white" 
+              value={it.value} 
+              onChange={(e: any) => { 
+                const v = clamp(Math.round(Number(e.target.value) || 0), clampMin, clampMax); 
+                const next = items.slice(); 
+                next[i] = { ...it, value: v }; 
+                setItems(next); 
+              }} 
+            />
             <Label className="col-span-1 text-xs text-slate-300">Weight</Label>
-            <Input className="col-span-1 bg-white/10 border-white/20 text-white" value={it.weight} onChange={e=>{ const w=Math.max(0, Number(e.target.value)||0); const next=items.slice(); next[i]={...it, weight:w}; setItems(next); }} />
-            <Button variant="outline" className="col-span-1 bg-white/10 hover:bg-white/20 border-white/20 text-white" onClick={()=>{ const next=items.slice(); next.splice(i,1); setItems(next); }}>Remove</Button>
+            <Input 
+              className="col-span-1 bg-white/10 border-white/20 text-white" 
+              value={it.weight} 
+              onChange={(e: any) => { 
+                const w = Math.max(0, Number(e.target.value) || 0); 
+                const next = items.slice(); 
+                next[i] = { ...it, weight: w }; 
+                setItems(next); 
+              }} 
+            />
+            <Button 
+              variant="outline" 
+              className="col-span-1 bg-white/10 hover:bg-white/20 border-white/20 text-white" 
+              onClick={() => { 
+                const next = items.slice(); 
+                next.splice(i, 1); 
+                setItems(next); 
+              }}
+            >
+              Remove
+            </Button>
           </div>
         ))}
       </div>
       <div className="flex gap-2">
-        <Button variant="secondary" className="bg-white/20 hover:bg-white/30 text-white border border-white/20" onClick={()=> setItems([...items, { value: clampMin, weight: 1 }])}>Add Row</Button>
-        <Button variant="outline" className="bg-white/10 hover:bg-white/20 border-white/20 text-white" onClick={()=> setItems([{ value: clampMin, weight: 1 }, { value: clampMax, weight: 1 }])}>Reset Rows</Button>
+        <Button 
+          variant="secondary" 
+          className="bg-white/20 hover:bg-white/30 text-white border border-white/20" 
+          onClick={() => setItems([...items, { value: clampMin, weight: 1 }])}
+        >
+          Add Row
+        </Button>
+        <Button 
+          variant="outline" 
+          className="bg-white/10 hover:bg-white/20 border-white/20 text-white" 
+          onClick={() => setItems([{ value: clampMin, weight: 1 }, { value: clampMax, weight: 1 }])}
+        >
+          Reset Rows
+        </Button>
       </div>
     </div>
   );
-}
+});
 
-function DistEditor({ label, spec, onChange, clampMin = -9999, clampMax = 9999, previewData }:
-  { label: string; spec: IntDistribution; onChange: (s: IntDistribution) => void; clampMin?: number; clampMax?: number; previewData?: { bin: string; count: number; }[]; }) {
+function DistEditor({ label, spec, onChange, clampMin = -9999, clampMax = 9999, previewData }: {
+  label: string; 
+  spec: IntDistribution; 
+  onChange: (s: IntDistribution) => void; 
+  clampMin?: number; 
+  clampMax?: number; 
+  previewData?: { bin: string; count: number; }[]; 
+}) {
   const kind = spec.kind;
   return (
-    <div className="rounded-2xl border border-white/20 bg-white/10 backdrop-blur-sm p-4 space-y-4 shadow-lg">
+    <GlassCard variant="subtle" className="p-4 space-y-4">
       <div className="flex items-center justify-between">
         <div className="text-white font-medium">{label}</div>
         <Select value={kind} onValueChange={(k)=>{ if(k==='uniform') onChange({ kind:'uniform', min:clampMin, max:clampMin+5 }); else if(k==='normal') onChange({ kind:'normal', mean:Math.max(clampMin,5), sd:2, min:clampMin, max:clampMax }); else onChange({ kind:'discrete', items:[ { value:clampMin, weight:1 }, { value:Math.min(clampMax, clampMin+1), weight:1 } ] }); }}>
           <SelectTrigger className="w-36 bg-white/10 border-white/20 text-white"><SelectValue /></SelectTrigger>
-          <SelectContent className="bg-slate-900/95 backdrop-blur-xl border-white/20">
+          <SelectContent className="bg-white/10 backdrop-blur-xl border-white/20 shadow-2xl">
             <SelectItem value="uniform">Uniform</SelectItem>
             <SelectItem value="normal">Normal</SelectItem>
             <SelectItem value="discrete">Discrete</SelectItem>
@@ -868,17 +1048,17 @@ function DistEditor({ label, spec, onChange, clampMin = -9999, clampMax = 9999, 
         <div className="lg:col-span-2 space-y-4">
           {kind==='uniform' && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <NumberField label="Min" value={(spec as any).min} onChange={(v)=> onChange({ kind:'uniform', min: clamp(v, clampMin, clampMax), max: Math.max((spec as any).max, v) }) } />
-              <NumberField label="Max" value={(spec as any).max} onChange={(v)=> onChange({ kind:'uniform', min: Math.min((spec as any).min, v), max: clamp(v, clampMin, clampMax) }) } />
+              <NumberInput label="Min" value={(spec as any).min} onChange={(v: number)=> onChange({ kind:'uniform', min: clamp(v, clampMin, clampMax), max: Math.max((spec as any).max, v) }) } />
+              <NumberInput label="Max" value={(spec as any).max} onChange={(v: number)=> onChange({ kind:'uniform', min: Math.min((spec as any).min, v), max: clamp(v, clampMin, clampMax) }) } />
             </div>
           )}
 
           {kind==='normal' && (
             <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-              <NumberField label="Mean" value={(spec as any).mean} onChange={(v)=> onChange({ ...(spec as any), mean: v }) } />
-              <NumberField label="SD" value={(spec as any).sd} onChange={(v)=> onChange({ ...(spec as any), sd: Math.max(0, v) }) } />
-              <NumberField label="Min" value={(spec as any).min} onChange={(v)=> onChange({ ...(spec as any), min: Math.min(v, (spec as any).max) }) } />
-              <NumberField label="Max" value={(spec as any).max} onChange={(v)=> onChange({ ...(spec as any), max: Math.max(v, (spec as any).min) }) } />
+              <NumberInput label="Mean" value={(spec as any).mean} onChange={(v: number)=> onChange({ ...(spec as any), mean: v }) } />
+              <NumberInput label="SD" value={(spec as any).sd} onChange={(v: number)=> onChange({ ...(spec as any), sd: Math.max(0, v) }) } />
+              <NumberInput label="Min" value={(spec as any).min} onChange={(v: number)=> onChange({ ...(spec as any), min: Math.min(v, (spec as any).max) }) } />
+              <NumberInput label="Max" value={(spec as any).max} onChange={(v: number)=> onChange({ ...(spec as any), max: Math.max(v, (spec as any).min) }) } />
             </div>
           )}
 
@@ -893,6 +1073,6 @@ function DistEditor({ label, spec, onChange, clampMin = -9999, clampMax = 9999, 
           </div>
         )}
       </div>
-    </div>
+    </GlassCard>
   );
 }
