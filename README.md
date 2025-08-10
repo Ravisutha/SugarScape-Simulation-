@@ -1,7 +1,10 @@
-git clone https://github.com/Ravisutha/SugarScape-Simulation-.git
 ## Sugarscape (minimal implementation)
 
 Small, browser-based recreation of the classic Sugarscape agent-based model.
+
+Demo: https://ravisutha.github.io/SugarScape-Simulation-/
+
+![Demo](./public/screenshots/demo.png)
 
 ### Run locally
 
